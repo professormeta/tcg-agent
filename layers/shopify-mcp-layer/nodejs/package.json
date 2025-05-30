@@ -1,0 +1,9 @@
+{
+  "name": "shopify-mcp-layer",
+  "version": "1.0.0",
+  "description": "Shopify MCP server for Lambda layer",
+  "main": "shopify-mcp-server.js",
+  "dependencies": {
+    "@shopify/mcp-server-storefront": "^1.0.0"
+  }
+}

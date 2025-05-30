@@ -1,0 +1,404 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Enhanced Strands Migration - One Piece TCG Agent with API Gateway, Streaming, and Full Tool Integration'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Deployment environment
+    
+  ProvisionedConcurrency:
+    Type: Number
+    Default: 2
+    Description: Number of provisioned concurrency units
+    
+  CustomDomainName:
+    Type: String
+    Default: ""
+    Description: Optional custom domain name for API Gateway
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CustomDomainName, ""]]
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 1024
+    Runtime: python3.12
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        PYTHONPATH: /var/task:/opt/python
+
+Resources:
+  # DynamoDB Table for WebSocket Connection Management
+  WebSocketConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'tcg-strands-websocket-connections-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+        - AttributeName: sessionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: sessionId-index
+          KeySchema:
+            - AttributeName: sessionId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # HTTP API Gateway for REST endpoints
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub 'tcg-strands-http-api-${Environment}'
+      Description: HTTP API for One Piece TCG Strands Agent
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowCredentials: false
+        AllowHeaders:
+          - content-type
+          - x-amz-date
+          - authorization
+          - x-api-key
+          - x-session-id
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowOrigins:
+          - "*"
+
+  # WebSocket API for streaming responses
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub 'tcg-strands-websocket-api-${Environment}'
+      Description: WebSocket API for streaming responses
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  # Lambda Function - Enhanced with full functionality
+  StrandsAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'one-piece-tcg-strands-agent-enhanced-${Environment}'
+      CodeUri: .
+      Handler: strands_lambda_handler_enhanced.handler
+      
+      # Auto-publish alias for versioning
+      AutoPublishAlias: live
+      
+      Environment:
+        Variables:
+          # Parameter Store paths - secrets loaded at runtime
+          SHOPIFY_URL_PARAM: !Sub '/tcg-agent/${Environment}/shopify/store-url'
+          SHOPIFY_ACCESS_TOKEN_PARAM: !Sub '/tcg-agent/${Environment}/shopify/access-token'
+          SHOPIFY_STOREFRONT_TOKEN_PARAM: !Sub '/tcg-agent/${Environment}/shopify/storefront-token'
+          COMPETITIVE_DECK_SECRET_PARAM: !Sub '/tcg-agent/${Environment}/deck-api/secret'
+          COMPETITIVE_DECK_ENDPOINT_PARAM: !Sub '/tcg-agent/${Environment}/deck-api/endpoint'
+          LANGFUSE_PUBLIC_KEY_PARAM: !Sub '/tcg-agent/${Environment}/langfuse/public-key'
+          LANGFUSE_SECRET_KEY_PARAM: !Sub '/tcg-agent/${Environment}/langfuse/secret-key'
+          LANGFUSE_API_URL_PARAM: !Sub '/tcg-agent/${Environment}/langfuse/api-url'
+          # WebSocket and API Gateway configuration
+          WEBSOCKET_API_ENDPOINT: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+          HTTP_API_ENDPOINT: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+          CONNECTIONS_TABLE_NAME: !Ref WebSocketConnectionsTable
+      
+      Layers:
+        - !Ref StrandsLayer
+        - !Ref ShopifyMCPLayer
+      
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # Parameter Store access for secrets
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource: 
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/tcg-agent/${Environment}/*'
+            # Bedrock access for LLM calls (all regions)
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:ConverseStream
+              Resource: 
+                - arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0
+                - arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0
+                - arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0
+                - !Sub 'arn:aws:bedrock:us-east-1:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0'
+                - !Sub 'arn:aws:bedrock:us-west-2:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0'
+                - !Sub 'arn:aws:bedrock:us-east-2:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0'
+            # DynamoDB access for WebSocket connections
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource: 
+                - !GetAtt WebSocketConnectionsTable.Arn
+                - !Sub '${WebSocketConnectionsTable.Arn}/index/*'
+            # API Gateway Management for WebSocket
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: 
+                - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # WebSocket Handler Function
+  WebSocketHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'tcg-strands-websocket-handler-${Environment}'
+      CodeUri: .
+      Handler: websocket_handler.handler
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE_NAME: !Ref WebSocketConnectionsTable
+          MAIN_FUNCTION_NAME: !Ref StrandsAgentFunction
+      Layers:
+        - !Ref StrandsLayer
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+              Resource: 
+                - !GetAtt WebSocketConnectionsTable.Arn
+                - !Sub '${WebSocketConnectionsTable.Arn}/index/*'
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: 
+                - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: 
+                - !GetAtt StrandsAgentFunction.Arn
+
+  # HTTP API Integration
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StrandsAgentFunction.Arn}/invocations'
+      PayloadFormatVersion: '2.0'
+
+  # HTTP API Routes
+  HttpApiChatRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /chat'
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+
+  HttpApiHealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /health'
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+
+  # HTTP API Stage
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: !Ref Environment
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+  # WebSocket API Integrations
+  WebSocketConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketHandlerFunction.Arn}/invocations'
+
+  WebSocketDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketHandlerFunction.Arn}/invocations'
+
+  WebSocketMessageIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketHandlerFunction.Arn}/invocations'
+
+  # WebSocket API Routes
+  WebSocketConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: '$connect'
+      Target: !Sub 'integrations/${WebSocketConnectIntegration}'
+
+  WebSocketDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: '$disconnect'
+      Target: !Sub 'integrations/${WebSocketDisconnectIntegration}'
+
+  WebSocketMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: 'message'
+      Target: !Sub 'integrations/${WebSocketMessageIntegration}'
+
+  # WebSocket API Stage
+  WebSocketApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: !Ref Environment
+      AutoDeploy: true
+
+  # Lambda Permissions for API Gateway
+  HttpApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StrandsAgentFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+  WebSocketLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebSocketHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+
+  # Lambda Layers (same as before)
+  StrandsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub 'strands-agents-layer-${Environment}'
+      Description: Strands Agents framework and Python dependencies
+      ContentUri: layers/strands-layer/strands-layer.zip
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+
+  ShopifyMCPLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub 'shopify-mcp-layer-${Environment}'
+      Description: Shopify MCP server for Node.js
+      ContentUri: layers/shopify-mcp-layer/shopify-mcp-layer.zip
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+
+  # CloudWatch Log Groups
+  StrandsAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/one-piece-tcg-strands-agent-enhanced-${Environment}'
+      RetentionInDays: 14
+
+  WebSocketHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/tcg-strands-websocket-handler-${Environment}'
+      RetentionInDays: 14
+
+  # Custom Domain (Optional)
+  CustomDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref CustomDomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Sub 'arn:aws:acm:${AWS::Region}:${AWS::AccountId}:certificate/*'
+          EndpointType: REGIONAL
+
+  HttpApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref CustomDomain
+      ApiId: !Ref HttpApi
+      Stage: !Ref HttpApiStage
+
+Outputs:
+  HttpApiUrl:
+    Description: 'HTTP API Gateway URL for REST endpoints'
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-HttpApiUrl'
+
+  WebSocketApiUrl:
+    Description: 'WebSocket API Gateway URL for streaming'
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketApiUrl'
+
+  ChatEndpoint:
+    Description: 'Chat endpoint for HTTP requests'
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/chat'
+    Export:
+      Name: !Sub '${AWS::StackName}-ChatEndpoint'
+
+  HealthEndpoint:
+    Description: 'Health check endpoint'
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/health'
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthEndpoint'
+      
+  FunctionName:
+    Description: 'Enhanced Lambda Function Name'
+    Value: !Ref StrandsAgentFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
+      
+  FunctionArn:
+    Description: 'Enhanced Lambda Function ARN'
+    Value: !GetAtt StrandsAgentFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionArn'
+      
+  Environment:
+    Description: 'Deployment Environment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  CustomDomainUrl:
+    Description: 'Custom domain URL (if configured)'
+    Condition: HasCustomDomain
+    Value: !Sub 'https://${CustomDomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomDomainUrl'

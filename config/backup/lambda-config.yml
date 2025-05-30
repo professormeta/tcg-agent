@@ -1,0 +1,214 @@
+# AWS Lambda Configuration for Strands Migration
+# This replaces the current Node.js Lambda with Python + Strands
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Strands Migration - One Piece TCG Customer Service Agent'
+
+Parameters:
+  # Shopify Configuration
+  ShopifyUrl:
+    Type: String
+    Description: Shopify store URL
+    Default: !Ref AWS::NoValue
+    
+  ShopifyAccessToken:
+    Type: String
+    Description: Shopify Admin API access token
+    NoEcho: true
+    
+  ShopifyStorefrontToken:
+    Type: String
+    Description: Shopify Storefront API access token
+    NoEcho: true
+    
+  # One Piece TCG API Configuration
+  CompetitiveDeckSecret:
+    Type: String
+    Description: API key for competitive deck service
+    NoEcho: true
+    
+  CompetitiveDeckEndpoint:
+    Type: String
+    Description: API endpoint for competitive deck service
+    
+  # Monitoring Configuration
+  LangfusePublicKey:
+    Type: String
+    Description: Langfuse public key for monitoring
+    
+  LangfuseSecretKey:
+    Type: String
+    Description: Langfuse secret key for monitoring
+    NoEcho: true
+    
+  LangfuseApiUrl:
+    Type: String
+    Description: Langfuse API URL
+    Default: https://cloud.langfuse.com
+
+Resources:
+  # Lambda Function
+  StrandsAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: one-piece-tcg-strands-agent
+      Runtime: python3.11
+      Handler: strands_lambda_handler.handler
+      CodeUri: ../
+      Timeout: 300
+      MemorySize: 1024
+      
+      # Provisioned Concurrency for consistent performance
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrencyUnits: 2
+      
+      Environment:
+        Variables:
+          # Shopify Configuration
+          SHOPIFY_URL: !Ref ShopifyUrl
+          SHOPIFY_ACCESS_TOKEN: !Ref ShopifyAccessToken
+          SHOPIFY_STOREFRONT_ACCESS_TOKEN: !Ref ShopifyStorefrontToken
+          
+          # One Piece TCG API
+          COMPETITIVE_DECK_SECRET: !Ref CompetitiveDeckSecret
+          COMPETITIVE_DECK_ENDPOINT: !Ref CompetitiveDeckEndpoint
+          
+          # Monitoring
+          LANGFUSE_PUBLIC_KEY: !Ref LangfusePublicKey
+          LANGFUSE_SECRET_KEY: !Ref LangfuseSecretKey
+          LANGFUSE_API_URL: !Ref LangfuseApiUrl
+          
+          # Python path for imports
+          PYTHONPATH: /var/task:/opt/python
+      
+      Layers:
+        - !Ref StrandsLayer
+        - !Ref ShopifyMCPLayer
+      
+      # Function URL (maintains same external interface)
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowCredentials: false
+          AllowHeaders:
+            - content-type
+            - x-amz-date
+            - authorization
+            - x-api-key
+          AllowMethods:
+            - POST
+            - GET
+            - OPTIONS
+          AllowOrigins:
+            - "*"
+        InvokeMode: RESPONSE_STREAM  # Enable streaming
+      
+      # IAM Role
+      Role: !GetAtt StrandsAgentRole.Arn
+
+  # IAM Role for Lambda
+  StrandsAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: 
+                  - arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0
+                  - arn:aws:bedrock:us-east-1:438465137422:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0
+
+  # Lambda Layers
+  StrandsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: strands-agents-layer
+      Description: Strands Agents framework and dependencies
+      ContentUri: layers/strands-layer/
+      CompatibleRuntimes:
+        - python3.11
+      RetentionPolicy: Delete
+
+  ShopifyMCPLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: shopify-mcp-layer
+      Description: Shopify MCP server for Node.js
+      ContentUri: layers/shopify-mcp-layer/
+      CompatibleRuntimes:
+        - python3.11
+      RetentionPolicy: Delete
+
+  # CloudWatch Log Group
+  StrandsAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StrandsAgentFunction}'
+      RetentionInDays: 14
+
+  # CloudWatch Alarms for monitoring
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${StrandsAgentFunction}-Errors'
+      AlarmDescription: 'Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref StrandsAgentFunction
+
+  DurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${StrandsAgentFunction}-Duration'
+      AlarmDescription: 'Lambda function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30000  # 30 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref StrandsAgentFunction
+
+Outputs:
+  FunctionUrl:
+    Description: 'Lambda Function URL for Shopify integration'
+    Value: !GetAtt StrandsAgentFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionUrl'
+      
+  FunctionName:
+    Description: 'Lambda Function Name'
+    Value: !Ref StrandsAgentFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
+      
+  FunctionArn:
+    Description: 'Lambda Function ARN'
+    Value: !GetAtt StrandsAgentFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionArn'

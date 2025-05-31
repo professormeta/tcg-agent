@@ -1,115 +1,161 @@
 """
-Migrated Deck Recommender Tool for Strands
-Preserves all existing business logic from the original Lambda function
+GumGum.gg Deck Recommender Tool for Strands Agent
+Integrates with GumGum.gg API to provide One Piece TCG deck recommendations
+Combines natural language processing with structured API calls
 """
 
 import os
 import json
-import boto3
 import requests
-import time
-import uuid
-from typing import Dict, Any, List, Tuple
+import logging
+import boto3
+from typing import Dict, List, Any, Optional, Tuple
 from strands import tool
-from langfuse import Langfuse
-from langfuse.decorators import observe
-from langfuse.decorators import langfuse_context
 
-# Initialize Langfuse client (preserve existing monitoring)
-LANGFUSE_PUBLIC_KEY = os.environ.get('LANGFUSE_PUBLIC_KEY')
-LANGFUSE_SECRET_KEY = os.environ.get('LANGFUSE_SECRET_KEY')
-LANGFUSE_API_URL = os.environ.get('LANGFUSE_API_URL')
+logger = logging.getLogger(__name__)
 
-if LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY:
-    langfuse = Langfuse(
-        public_key=LANGFUSE_PUBLIC_KEY,
-        secret_key=LANGFUSE_SECRET_KEY,
-        host=LANGFUSE_API_URL
-    )
-else:
-    langfuse = None
-
-# Environment Setup (preserve existing configuration)
-API_KEY = os.environ.get('COMPETITIVE_DECK_SECRET')
-API_ENDPOINT = os.environ.get('COMPETITIVE_DECK_ENDPOINT')
-
-# Initialize monitoring (preserve existing monitoring)
-try:
-    from chatbot_monitoring.monitoring import ChatbotMonitoring
-    monitor = ChatbotMonitoring()
-    store_id = 'Store123'
-except ImportError:
-    # Fallback if custom monitoring package not available
-    class MockMonitoring:
-        def log_metric(self, *args, **kwargs):
-            pass
-    monitor = MockMonitoring()
-    store_id = 'Store123'
-
-@observe(as_type="generation", name="Invoke LLM Bedrock to parse user input")
-def invoke_llm_bedrock(inputText: str, **kwargs) -> Dict[str, Any]:
+@tool
+def get_competitive_decks(user_input: str) -> Dict[str, Any]:
     """
-    Parse user input using Bedrock to extract set, region, and leader
-    Preserves existing LLM parsing logic
-    """
-    # Initialize the Bedrock client
-    bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+    Get competitive One Piece TCG deck recommendations from GumGum.gg database.
     
-    kwargs_clone = kwargs.copy()
-    input_text = inputText
-    model = kwargs_clone.pop('model_id', None)
-
-    if langfuse:
-        langfuse_context.update_current_observation(
-            input=input_text,
-            model=model,
-            metadata=kwargs_clone
-        )
-
-    inference_profile = "arn:aws:bedrock:us-east-1:438465137422:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0"
-
+    Processes natural language input to extract deck search criteria and returns
+    tournament-winning deck information with complete deck lists.
+    
+    Args:
+        user_input: Natural language description of deck requirements
+                   (e.g., "Show me the latest Red Luffy deck from OP10" or 
+                    "I want a competitive deck for Purple Doffy in the west region")
+    
+    Returns:
+        Dictionary containing deck recommendations with complete deck lists,
+        tournament information, and metadata. Always mentions data is powered by gumgum.gg.
+    """
+    
     try:
-        # Call the Bedrock model using the Messages API (preserve existing logic)
+        logger.info(f"Processing deck request: {user_input}")
+        
+        # Parse user input to extract filters using LLM
+        filters = parse_user_input_with_llm(user_input)
+        
+        if not filters:
+            return create_error_response("Failed to parse deck search criteria from input - AI parsing service unavailable")
+        
+        # Validate required filters
+        is_valid, missing_filters, validated_filters = validate_deck_filters(filters)
+        
+        if not is_valid:
+            return {
+                'success': False,
+                'error_type': 'insufficient_search_criteria',
+                'missing_filters': missing_filters,
+                'message': 'Additional information needed to find competitive decks',
+                'source': 'gumgum.gg',
+                'required_information': [
+                    'Tournament region: East (Asia) or West (North America/Europe)',
+                    'Game format/set: e.g., OP10, OP09, ST10',
+                    'Leader card or character: e.g., Red Luffy, Purple Doffy, Shanks'
+                ],
+                'example_requests': [
+                    'Show me a Red Luffy deck for OP10 in the West region',
+                    'I want a competitive Purple Doflamingo deck from the latest set',
+                    'Find me tournament decks for Shanks in the East region'
+                ]
+            }
+        
+        # Get deck data from API
+        deck_data = fetch_competitive_deck_data(validated_filters)
+        
+        if deck_data['success']:
+            return format_competitive_deck_response(deck_data, validated_filters)
+        else:
+            error_details = deck_data.get('error', 'Unknown error')
+            logger.error(f"Failed to retrieve deck data from gumgum.gg API: {error_details}")
+            return create_error_response(f"GumGum.gg API error: {error_details}")
+            
+    except Exception as e:
+        logger.error(f"Error in get_competitive_decks: {str(e)}")
+        return create_error_response(f"Deck recommendation service error: {str(e)}")
+
+def parse_user_input_with_llm(user_input: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse user input using AWS Bedrock to extract deck search criteria
+    """
+    try:
+        # Initialize Bedrock client
+        bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+        
+        # System prompt for parsing deck requests
+        system_prompt = """Parse the input and output 3 fields in JSON format: set, region, and leader.
+
+Region rules:
+- "west" = North America, Europe, or any non-Asian location
+- "east" = Asia (Japan, etc.)
+- If no region specified, default to "west"
+
+Set rules:
+- Can be called "set" or "format"
+- If user says "latest set/format" or doesn't specify, use "OP10" for west, "OP11" for east
+- Examples: OP01, OP02, OP10, ST10
+
+Leader rules:
+- Convert to card ID format (e.g., OP01-001, ST08-001)
+- Handle color names (Red Luffy, Purple Doffy, BY Luffy where BY = Black/Yellow)
+- Handle character nicknames (Doffy = Doflamingo)
+- Research the actual card ID for the leader
+
+Output only valid JSON with set, region, and leader fields."""
+
+        # Prepare the request
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "system": system_prompt,
+            "temperature": 0.1,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": user_input}]
+                }
+            ]
+        }
+        
+        # Call Bedrock
         response = bedrock_client.invoke_model(
-            modelId=inference_profile,  
+            modelId="us.anthropic.claude-3-haiku-20240307-v1:0",
             contentType="application/json",
             accept="application/json",
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",  
-                "max_tokens": 1024, 
-                "system": "Parse the input and output 3 fields in JSON format: set and region and leader. Region can only be west or east. West is defined as any tournament location not in Asia and in North America. East is defined as any location in Asia. If the input does not contain any information about a region, make region equal to west.  Set can also be referred to as format. If the user says 'latest set' or 'latest format' or does not specify a set at all, please use set equal to OP10 when the region is set to west and use set equal to OP11 when the region is set to east. Here are examples of sets, but not limited to: 'OP01' or 'OP02' or 'OP10' or 'ST10'.  Leader is the leader card specified by the user and should be in the format of OP01-001 (as an example only) or maybe OP01-060 (as another example).  The user may also specify the leader card by their color or colors (BY means Black and Yellow) and their name (i.e. Purple Luffy or Red Shanks or BY Luffy) or nick name (i.e. Doffy), please research the leader and convert the card to its card id.  Leader must be output in the right format (i.e. OP01-001 or ST08-001).    Output the response in a JSON format with set and format and leader.  Don't include anything else but a properly formatted JSON file in the output.", 
-                "temperature": 0.7,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": inputText
-                            }
-                        ]
-                    }
-                ],            
-            })
+            body=json.dumps(request_body)
         )
         
-        # Parse the response
+        # Parse response
         response_body = json.loads(response['body'].read().decode('utf-8'))
-        print("LLM response body:", response_body)
-        return response_body
-
+        content_text = response_body['content'][0]['text']
+        
+        # Extract JSON from response
+        parsed_content = json.loads(content_text)
+        
+        logger.info(f"Parsed filters from LLM: {parsed_content}")
+        return parsed_content
+        
+    except boto3.exceptions.Boto3Error as e:
+        logger.error(f"AWS Bedrock service error: {e}")
+        raise RuntimeError(f"AI parsing service unavailable: {e}. Unable to process deck search request without natural language parsing.")
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON response from Bedrock: {e}")
+        raise RuntimeError(f"AI parsing service returned invalid response: {e}. Unable to extract deck search criteria.")
     except Exception as e:
-        print(f"Error invoking AWS Bedrock model: {e}")
-        raise
+        logger.error(f"Failed to parse user input with LLM: {e}")
+        raise RuntimeError(f"AI parsing service error: {e}. Cannot process natural language deck requests without this service.")
 
 def validate_deck_filters(filters: Dict[str, Any]) -> Tuple[bool, List[str], Dict[str, Any]]:
     """
-    Validate deck filters (preserve existing validation logic)
+    Validate that required deck search filters are present
     """
     required_filters = {
-        'region': 'the tournament region (e.g., East, West)',
-        'set': 'the game format (e.g., OP09, OP08)',
-        'leader': 'the leader card id (e.g. OP01-060)'
+        'region': 'tournament region (East for Asia, West for North America)',
+        'set': 'game format/set (e.g., OP10, OP09)',
+        'leader': 'leader card ID (e.g., OP01-060)'
     }
     
     missing_filters = []
@@ -121,209 +167,140 @@ def validate_deck_filters(filters: Dict[str, Any]) -> Tuple[bool, List[str], Dic
         else:
             validated_filters[key] = filters[key]
     
-    print("Validated filters:", validated_filters)
-    print("Missing filters:", missing_filters)
-
+    logger.info(f"Validated filters: {validated_filters}")
+    logger.info(f"Missing filters: {missing_filters}")
+    
     return len(missing_filters) == 0, missing_filters, validated_filters
 
-@observe(name="API call to gumgum")
-def get_competitive_decks_api(filters: Dict[str, Any] = None) -> Dict[str, Any]:
+def fetch_competitive_deck_data(filters: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Call the competitive decks API (preserve existing API logic)
+    Fetch competitive deck data from the GumGum.gg API
     """
-    print("Inside competitive decks API function")
     try:
-        start_time = time.time()
-
-        is_valid, missing_filters, validated_filters = validate_deck_filters(filters or {})
+        # Get API credentials from environment
+        api_endpoint = os.environ.get('COMPETITIVE_DECK_ENDPOINT')
+        api_key = os.environ.get('COMPETITIVE_DECK_SECRET')
         
-        if not is_valid:
-            print("Additional information needed for deck search")
-            return {
-                'success': False,
-                'missing_filters': missing_filters,
-                'message': 'Additional information needed'
-            }
+        if not api_endpoint:
+            raise RuntimeError("GumGum.gg API endpoint not configured. Check COMPETITIVE_DECK_ENDPOINT environment variable.")
         
+        if not api_key:
+            raise RuntimeError("GumGum.gg API key not configured. Check COMPETITIVE_DECK_SECRET environment variable.")
+        
+        # Prepare API request
         headers = {
-            'Authorization': f'Bearer {API_KEY}',
-            'Content-Type': 'application/json'
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'OnePieceTCGStrandsAgent/2.0'
         }
         
+        # Make API call
         response = requests.get(
-            f"{API_ENDPOINT}",
+            api_endpoint,
             headers=headers,
-            params=validated_filters
+            params=filters,
+            timeout=10
         )
+        
+        # Handle specific HTTP errors
+        if response.status_code == 401:
+            raise RuntimeError("GumGum.gg API authentication failed. Invalid API key.")
+        elif response.status_code == 403:
+            raise RuntimeError("GumGum.gg API access forbidden. Check API key permissions.")
+        elif response.status_code == 404:
+            raise RuntimeError("GumGum.gg API endpoint not found. Check API endpoint configuration.")
+        elif response.status_code == 429:
+            raise RuntimeError("GumGum.gg API rate limit exceeded. Please try again later.")
+        elif response.status_code >= 500:
+            raise RuntimeError(f"GumGum.gg API server error (HTTP {response.status_code}). Service temporarily unavailable.")
+        
         response.raise_for_status()
-                
-        # Log successful API call (preserve existing monitoring)
-        monitor.log_metric('APICallSuccess', 1, store_id=store_id)
-        monitor.log_metric('DeckLookupsWithSuccessRate', 100, store_id=store_id)
-
+        
         decks_data = response.json()
-
-        # Get only the first deck (assuming decks_data is already sorted by recency)
+        
+        # Get the most recent deck
         latest_deck = decks_data[0] if decks_data else None
-
+        
         if latest_deck:
             return {
                 'success': True,
-                'deck': {
-                    'set': latest_deck.get('set'),
-                    'region': latest_deck.get('region'),
-                    'author': latest_deck.get('author'),
-                    'tournament': latest_deck.get('tournament'),
-                    'event': latest_deck.get('event'),
-                    'leader': latest_deck.get('leader'),
-                    'decklist': latest_deck.get('decklist', [])
-                }
+                'deck': latest_deck
             }
         else:
             return {
                 'success': False,
-                'message': 'No decks available'
+                'error': f'No tournament decks found for {filters.get("leader", "specified leader")} in {filters.get("region", "specified region")} region for format {filters.get("set", "specified format")}'
             }
-
+            
     except requests.exceptions.Timeout:
-        # Log API timeout (preserve existing monitoring)
-        monitor.log_metric('APICallTimeouts', 1, store_id=store_id)
-        return {
-            'success': False,
-            'error': 'API request timed out'
-        }
-
-    except Exception as error:
-        # Log other API errors (preserve existing monitoring)
-        monitor.log_metric('APICallErrors', 1, store_id=store_id)
-        monitor.log_metric('DeckLookupsWithSuccessRate', 0, store_id=store_id)
-        print(f'Error fetching competitive decks: {error}')
-        return {
-            'success': False,
-            'error': str(error)
-        }
-
-    finally:
-        latency = (time.time() - start_time) * 1000
-        monitor.log_metric('APICallLatency', latency, store_id=store_id)
-
-@tool
-@observe(name="get_competitive_decks_strands_tool")
-def get_competitive_decks(user_query: str) -> str:
-    """
-    Get competitive One Piece TCG decks from gumgum.gg database.
-    
-    This tool helps users find tournament-winning decks for the One Piece Trading Card Game.
-    It searches the gumgum.gg database for competitive decks based on leader, set, and region.
-    
-    Args:
-        user_query: User's request for deck information. Can include:
-                   - Leader name (e.g., "Red Shanks", "Purple Luffy", "BY Luffy")
-                   - Set/Format (e.g., "OP09", "OP10", "latest set")
-                   - Region (e.g., "West", "East", tournament location)
-                   
-    Returns:
-        Formatted deck information including decklist and tournament details
-        
-    Examples:
-        - "Show me a Red Shanks deck for OP09 West"
-        - "Latest Purple Luffy deck from East region"
-        - "Doffy deck OP08"
-    """
-    try:
-        # Log deck lookup (preserve existing monitoring)
-        monitor.log_metric('DeckLookups', 1, store_id=store_id)
-        
-        # Parse user input for set, region and leader using existing LLM logic
-        trace_id = str(uuid.uuid4())
-        agentId = '9YPRBXYN2H'  # Preserve existing agent ID for monitoring
-        agentAliasId = 'FK0NHPPG6L'  # Preserve existing alias ID
-        sessionId = f"session-{int(time.time())}"
-        userId = "strands-user"
-        agent_model_id = "anthropic.claude-3-5-haiku-20241022-v1:0"
-        
-        # Tags for filtering in Langfuse (preserve existing monitoring)
-        tags = ["bedrock-llm-3-5-haiku", "strands-migration", "deck-recommender"]
-        project_name = "One Piece TCG Deck Recommender"
-        environment = "production"
-
-        # Invoke LLM via Bedrock to parse user input
-        llm_response = invoke_llm_bedrock(
-            user_query,
-            agentId=agentId,
-            agentAliasId=agentAliasId,
-            sessionId=sessionId,
-            userId=userId,
-            tags=tags,
-            trace_id=trace_id,
-            project_name=project_name,
-            environment=environment,
-            model_id=agent_model_id
-        )
-        
-        print("LLM parsing response:", llm_response)
-
-        # Extract the JSON string from the 'content' field
-        content_text = llm_response['content'][0]['text']
-        print("Parsed content text:", content_text)
-
-        # Parse the JSON string to extract 'set', 'region', and 'leader'
-        parsed_content = json.loads(content_text)
-        print("Parsed content:", parsed_content)
-
-        # Use parsed values (with fallbacks matching original logic)
-        set_value = parsed_content.get('set', 'OP09')  # Default to OP09
-        region_value = parsed_content.get('region', 'west')
-        leader_value = parsed_content.get('leader', 'OP01-060')
-
-        print(f"Extracted - Set: {set_value}, Region: {region_value}, Leader: {leader_value}")
-
-        # Call the competitive decks API
-        filters = {
-            'region': region_value,
-            'set': set_value,
-            'leader': leader_value
-        }
-        
-        deck_result = get_competitive_decks_api(filters)
-        
-        if deck_result.get('success'):
-            deck = deck_result['deck']
-            
-            # Format response with pirate theme (matching system prompt)
-            deck_info = f"""🏴‍☠️ **Ahoy! I found a treasure of a deck for ye!**
-
-**Leader:** {deck.get('leader', 'Unknown')}
-**Set/Format:** {deck.get('set', 'Unknown')}
-**Region:** {deck.get('region', 'Unknown')}
-**Deck Author:** {deck.get('author', 'Unknown Pirate')}
-**Tournament:** {deck.get('tournament', 'Unknown Tournament')}
-**Event:** {deck.get('event', 'Unknown Event')}
-
-**⚔️ Complete Decklist:**
-{chr(10).join(deck.get('decklist', ['No decklist available']))}
-
-*This competitive deck data is powered by [www.gumgum.gg](https://www.gumgum.gg) - the premier source for One Piece TCG tournament data!*
-
-Would ye like me to help ye find any of these cards in our store inventory, matey?"""
-
-            return deck_info
-            
-        elif not deck_result.get('success') and deck_result.get('missing_filters'):
-            return f"Arrr! I need more information to find the perfect deck for ye! Please specify: {', '.join(deck_result['missing_filters'])}"
-            
-        else:
-            return f"Blast! No competitive decks found for those criteria, matey! Try searching for a different leader, set, or region. The seas of tournament data might not have what ye seek!"
-            
-    except json.JSONDecodeError as e:
-        print(f"JSON parsing error: {e}")
-        return "Arrr! Had trouble parsing yer request, matey! Could ye try rephrasing what deck ye be lookin' for?"
-        
+        raise RuntimeError("GumGum.gg API request timeout. The service may be experiencing high load.")
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError("Cannot connect to GumGum.gg API. Check network connectivity or service availability.")
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"GumGum.gg API request failed: {e}")
     except Exception as e:
-        print(f"Error in get_competitive_decks: {e}")
-        return f"Shiver me timbers! Encountered an error while searching for decks: {str(e)}. Please try again, ye scurvy dog!"
-        
-    finally:
-        # Flush Langfuse context (preserve existing monitoring)
-        if langfuse:
-            langfuse_context.flush()
+        raise RuntimeError(f"Unexpected error accessing GumGum.gg API: {e}")
+
+def format_competitive_deck_response(deck_data: Dict[str, Any], filters: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Format the competitive deck response for the agent
+    """
+    deck = deck_data['deck']
+    
+    return {
+        'success': True,
+        'source': 'gumgum.gg',
+        'message': 'Tournament-winning deck data powered by www.gumgum.gg',
+        'deck': {
+            'name': f"{deck.get('leader', 'Unknown')} Tournament Deck",
+            'set': deck.get('set', filters.get('set')),
+            'region': deck.get('region', filters.get('region')),
+            'leader': deck.get('leader', filters.get('leader')),
+            'author': deck.get('author', 'Tournament Player'),
+            'tournament': deck.get('tournament', 'Competitive Tournament'),
+            'event': deck.get('event', 'Tournament Event'),
+            'decklist': deck.get('decklist', []),
+            'total_cards': len(deck.get('decklist', []))
+        },
+        'metadata': {
+            'data_source': 'gumgum.gg tournament database',
+            'search_criteria': filters,
+            'competitive_level': 'Tournament-winning',
+            'disclaimer': 'Deck data powered by www.gumgum.gg'
+        }
+    }
+
+
+def create_error_response(error_message: str) -> Dict[str, Any]:
+    """
+    Create a standardized error response with detailed troubleshooting information
+    """
+    return {
+        'success': False,
+        'source': 'gumgum.gg',
+        'error': error_message,
+        'error_type': 'deck_service_error',
+        'message': 'Unable to retrieve competitive deck data',
+        'troubleshooting': {
+            'possible_causes': [
+                'GumGum.gg API service unavailable',
+                'Invalid search criteria provided',
+                'Network connectivity issues',
+                'AI parsing service failure'
+            ],
+            'user_actions': [
+                'Try rephrasing your deck request with specific details',
+                'Include region (East/West), format (OP10, OP09), and leader name',
+                'Wait a moment and try again if service is temporarily unavailable'
+            ],
+            'example_requests': [
+                'Show me a Red Luffy deck for OP10 in the West region',
+                'Find tournament decks for Purple Doflamingo in the latest format'
+            ]
+        },
+        'metadata': {
+            'error_type': 'deck_retrieval_error',
+            'data_source': 'gumgum.gg',
+            'service_status': 'error'
+        }
+    }

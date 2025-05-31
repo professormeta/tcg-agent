@@ -88,7 +88,7 @@ store_parameter "/tcg-agent/$ENVIRONMENT/deck-api/endpoint" "$DECK_API_ENDPOINT"
 
 store_parameter "/tcg-agent/$ENVIRONMENT/langfuse/public-key" "$LANGFUSE_PUBLIC_KEY" "String"
 store_parameter "/tcg-agent/$ENVIRONMENT/langfuse/secret-key" "$LANGFUSE_SECRET_KEY" "SecureString"
-store_parameter "/tcg-agent/$ENVIRONMENT/langfuse/api-url" "$LANGFUSE_API_URL" "String"
+store_parameter "/tcg-agent/$ENVIRONMENT/langfuse/host" "$LANGFUSE_API_URL" "String"
 
 echo -e "\n${GREEN}✅ All secrets stored successfully!${NC}"
 echo -e "\n${YELLOW}📝 Next steps:${NC}"

@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Clean Strands TCG Agent - Container Image Deployment'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment name
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 1024
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        # Langfuse Configuration
+        LANGFUSE_PUBLIC_KEY_PARAM: !Sub '/tcg-agent/${Environment}/langfuse/public-key'
+        LANGFUSE_SECRET_KEY_PARAM: !Sub '/tcg-agent/${Environment}/langfuse/secret-key'
+        LANGFUSE_HOST_PARAM: !Sub '/tcg-agent/${Environment}/langfuse/host'
+        # API Configuration
+        COMPETITIVE_DECK_ENDPOINT_PARAM: !Sub '/tcg-agent/${Environment}/deck-api/endpoint'
+        COMPETITIVE_DECK_SECRET_PARAM: !Sub '/tcg-agent/${Environment}/deck-api/secret'
+        SHOPIFY_STORE_URL_PARAM: !Sub '/tcg-agent/${Environment}/shopify/store-url'
+        SHOPIFY_ACCESS_TOKEN_PARAM: !Sub '/tcg-agent/${Environment}/shopify/access-token'
+
+Resources:
+  # Main Lambda Function - Container Image
+  StrandsAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-agent'
+      PackageType: Image
+      ImageUri: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}-agent:latest'
+      Description: 'Strands TCG Agent with container image deployment'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource:
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/tcg-agent/${Environment}/*'
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: '*'
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+            RestApiId: !Ref StrandsApi
+        HealthCheck:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: GET
+            RestApiId: !Ref StrandsApi
+    Metadata:
+      DockerTag: latest
+      DockerContext: ./
+      Dockerfile: Dockerfile
+
+  # API Gateway
+  StrandsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      DefinitionBody:
+        openapi: 3.0.1
+        info:
+          title: !Sub '${AWS::StackName} API'
+          version: '1.0'
+        paths:
+          /{proxy+}:
+            x-amazon-apigateway-any-method:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StrandsAgentFunction.Arn}/invocations'
+          /health:
+            get:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StrandsAgentFunction.Arn}/invocations'
+
+  # Lambda Permission for API Gateway
+  StrandsAgentFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StrandsAgentFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${StrandsApi}/*/*'
+
+  # Health Check Permission
+  StrandsAgentHealthPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StrandsAgentFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${StrandsApi}/*/GET/health'
+
+Outputs:
+  ApiUrl:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${StrandsApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiUrl'
+
+  FunctionName:
+    Description: 'Lambda function name'
+    Value: !Ref StrandsAgentFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
+
+  FunctionArn:
+    Description: 'Lambda function ARN'
+    Value: !GetAtt StrandsAgentFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionArn'
+
+  ImageUri:
+    Description: 'Container image URI'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}-agent:latest'
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageUri'

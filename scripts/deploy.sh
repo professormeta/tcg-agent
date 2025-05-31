@@ -14,7 +14,7 @@ NC='\033[0m' # No Color
 
 # Default environment
 ENVIRONMENT=${1:-production}
-STACK_NAME="strands-tcg-agent-full-$ENVIRONMENT"
+STACK_NAME="strands-tcg-agent-$ENVIRONMENT"
 
 echo -e "${GREEN}🚀 Deploying Strands Migration (Environment: $ENVIRONMENT)${NC}"
 
@@ -39,6 +39,12 @@ if ! command -v sam &> /dev/null; then
     exit 1
 fi
 
+# Check Docker is running (required for container builds)
+if ! docker info &> /dev/null; then
+    echo -e "${RED}❌ Docker is not running. Please start Docker Desktop.${NC}"
+    exit 1
+fi
+
 # Check AWS credentials
 if ! aws sts get-caller-identity &> /dev/null; then
     echo -e "${RED}❌ AWS credentials not configured. Please run 'aws configure'.${NC}"
@@ -52,17 +58,11 @@ if ! aws ssm get-parameters-by-path --path "/tcg-agent/$ENVIRONMENT" --recursive
     exit 1
 fi
 
-# Check if layers are built
-if [ ! -f "layers/strands-layer/strands-layer.zip" ] || [ ! -f "layers/shopify-mcp-layer/shopify-mcp-layer.zip" ]; then
-    echo -e "${RED}❌ Lambda layers not built. Please run './scripts/build-layers.sh' first.${NC}"
-    exit 1
-fi
-
 echo -e "${GREEN}✓ All prerequisites verified${NC}"
 
 # Build the SAM application
-echo -e "\n${YELLOW}🏗️ Building SAM application...${NC}"
-sam build --use-container
+echo -e "\n${YELLOW}🏗️ Building SAM application (container image)...${NC}"
+sam build
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}❌ SAM build failed${NC}"
@@ -90,7 +90,6 @@ sam deploy \
     --capabilities CAPABILITY_IAM \
     --parameter-overrides \
         Environment="$ENVIRONMENT" \
-        ProvisionedConcurrency=2 \
     --tags \
         Environment="$ENVIRONMENT" \
         Project="TCG-Strands-Agent" \
@@ -104,9 +103,9 @@ fi
 # Get deployment outputs
 echo -e "\n${YELLOW}📋 Retrieving deployment information...${NC}"
 
-FUNCTION_URL=$(aws cloudformation describe-stacks \
+API_URL=$(aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
-    --query 'Stacks[0].Outputs[?OutputKey==`FunctionUrl`].OutputValue' \
+    --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
     --output text)
 
 FUNCTION_NAME=$(aws cloudformation describe-stacks \
@@ -119,14 +118,20 @@ FUNCTION_ARN=$(aws cloudformation describe-stacks \
     --query 'Stacks[0].Outputs[?OutputKey==`FunctionArn`].OutputValue' \
     --output text)
 
+IMAGE_URI=$(aws cloudformation describe-stacks \
+    --stack-name "$STACK_NAME" \
+    --query 'Stacks[0].Outputs[?OutputKey==`ImageUri`].OutputValue' \
+    --output text)
+
 # Save deployment info
 cat > deployment-info.json << EOF
 {
   "environment": "$ENVIRONMENT",
   "stack_name": "$STACK_NAME",
-  "function_url": "$FUNCTION_URL",
+  "function_url": "$API_URL",
   "function_name": "$FUNCTION_NAME",
   "function_arn": "$FUNCTION_ARN",
+  "image_uri": "$IMAGE_URI",
   "deployment_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "region": "$(aws configure get region)"
 }
@@ -136,13 +141,14 @@ echo -e "\n${GREEN}🎉 Deployment completed successfully!${NC}"
 echo -e "\n${YELLOW}📋 Deployment Summary:${NC}"
 echo -e "Environment: ${BLUE}$ENVIRONMENT${NC}"
 echo -e "Stack Name: ${BLUE}$STACK_NAME${NC}"
-echo -e "Function URL: ${BLUE}$FUNCTION_URL${NC}"
+echo -e "API URL: ${BLUE}$API_URL${NC}"
 echo -e "Function Name: ${BLUE}$FUNCTION_NAME${NC}"
+echo -e "Container Image: ${BLUE}$IMAGE_URI${NC}"
 
 # Test the deployment
 echo -e "\n${YELLOW}🧪 Running basic health check...${NC}"
 
-HEALTH_CHECK=$(curl -s -X POST "$FUNCTION_URL" \
+HEALTH_CHECK=$(curl -s -X POST "$API_URL" \
     -H "Content-Type: application/json" \
     -d '{"inputText": "Hello", "sessionId": "health-check"}' \
     --max-time 30 || echo "FAILED")
@@ -154,7 +160,7 @@ else
 fi
 
 echo -e "\n${YELLOW}📝 Next steps:${NC}"
-echo -e "1. Update your Shopify webhook to: ${BLUE}$FUNCTION_URL${NC}"
+echo -e "1. Update your Shopify webhook to: ${BLUE}$API_URL${NC}"
 echo -e "2. Run comprehensive tests: ${GREEN}./scripts/test-deployment.sh${NC}"
 echo -e "3. Monitor logs: ${GREEN}aws logs tail /aws/lambda/$FUNCTION_NAME --follow${NC}"
 echo -e "4. View CloudWatch metrics in AWS Console"

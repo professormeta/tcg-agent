@@ -1,0 +1,29 @@
+# TCG Strands Agent - SSM Parameter Setup Commands
+# Run these AWS CLI commands to configure all required parameters
+
+# Replace the placeholder values with your actual secrets before running
+
+# Shopify Configuration
+aws ssm put-parameter --name "/tcg-agent/production/shopify/store-url" --value "https://tcg-ai.myshopify.com/" --type "String" --overwrite --description "Shopify store URL for TCG agent"
+
+aws ssm put-parameter --name "/tcg-agent/production/shopify/access-token" --value "YOUR_SHOPIFY_ACCESS_TOKEN_HERE" --type "SecureString" --overwrite --description "Shopify Admin API access token for TCG agent"
+
+aws ssm put-parameter --name "/tcg-agent/production/shopify/storefront-token" --value "YOUR_SHOPIFY_STOREFRONT_TOKEN_HERE" --type "SecureString" --overwrite --description "Shopify Storefront API access token for TCG agent"
+
+# Deck API Configuration  
+aws ssm put-parameter --name "/tcg-agent/production/deck-api/endpoint" --value "https://gumgum.gg/api/decklists" --type "String" --overwrite --description "Deck recommendation API endpoint"
+
+aws ssm put-parameter --name "/tcg-agent/production/deck-api/secret" --value "YOUR_DECK_API_SECRET_HERE" --type "SecureString" --overwrite --description "Deck recommendation API secret"
+
+# Langfuse Configuration
+aws ssm put-parameter --name "/tcg-agent/production/langfuse/public-key" --value "YOUR_LANGFUSE_PUBLIC_KEY_HERE" --type "String" --overwrite --description "Langfuse public key for monitoring"
+
+aws ssm put-parameter --name "/tcg-agent/production/langfuse/secret-key" --value "YOUR_LANGFUSE_SECRET_KEY_HERE" --type "SecureString" --overwrite --description "Langfuse secret key for monitoring"
+
+aws ssm put-parameter --name "/tcg-agent/production/langfuse/host" --value "https://cloud.langfuse.com" --type "String" --overwrite --description "Langfuse host URL for monitoring"
+
+# Verify all parameters were created
+aws ssm get-parameters-by-path --path "/tcg-agent/production" --recursive --with-decryption
+
+# Test the deployment after configuration
+curl https://mxrm5uczs2.execute-api.us-east-1.amazonaws.com/production/health

@@ -1,0 +1,11 @@
+version = 0.1
+[default.deploy.parameters]
+stack_name = "tcg-agent-prod"
+resolve_s3 = true
+s3_prefix = "tcg-agent-prod"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+parameter_overrides = "Environment=\"production\""
+image_repositories = ["StrandsAgentFunction=438465137422.dkr.ecr.us-east-1.amazonaws.com/tcgagentprodaa41c671/strandsagentfunctionf3271a8brepo"]

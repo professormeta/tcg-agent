@@ -9,15 +9,19 @@ layers/*/node_modules/
 # Deployment outputs
 deployment-endpoints.txt
 *-response.json
-samconfig.toml
+stack-outputs.json
+deployment-info.json
 
 # Environment files
 .env
 .env.local
 .env.*.local
+.env.production
+.env.staging
 
 # IDE files
 .vscode/settings.json
+.vscode/launch.json
 .idea/
 *.swp
 *.swo
@@ -38,7 +42,7 @@ __pycache__/
 dist/
 build/
 
-# Node.js
+# Node.js (for demo frontend)
 node_modules/
 npm-debug.log*
 yarn-debug.log*
@@ -80,5 +84,35 @@ coverage.xml
 local-config.json
 dev-config.json
 
-# Documentation files
-*.md
+# WebSocket Demo Files (for testing only)
+demo/test-connections.json
+demo/connection-logs.txt
+demo/*.log
+
+# Streaming Development Files
+streaming-test-*.json
+websocket-test-*.html
+connection-test-*.js
+
+# Agent Development Files (backup/test versions)
+agent_backup.py
+agent_fixed.py
+debug_agent.py
+test_ssm.py
+debug_*.py
+test_*.py
+
+# Packaging artifacts
+packaging/app.zip
+packaging/dependencies.zip
+packaging/_dependencies/
+
+# Local testing files
+local-test-*.json
+mock-*.json
+
+# Documentation - Only ignore personal notes
+NOTES.md
+TODO.md
+SCRATCH.md
+# Keep README.md, API.md, DEPLOYMENT.md etc.

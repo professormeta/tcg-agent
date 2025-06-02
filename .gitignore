@@ -108,8 +108,12 @@ packaging/dependencies.zip
 packaging/_dependencies/
 
 # Local testing files
-local-test-*.json
+test-*.json
 mock-*.json
+tests/*
+postman/*
+evals/*
+check_env.py
 
 # Documentation - Only ignore personal notes
 NOTES.md

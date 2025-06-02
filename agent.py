@@ -4,7 +4,14 @@ Enhanced Strands Agent Handler with Shopify Storefront MCP Integration
 Integrates Shopify's standard Storefront MCP server following official best practices
 """
 
+# Import AWS configuration first to ensure region is set before any boto3 clients are created
+import aws_config
+
 import os
+# Enable OpenTelemetry tracing for Strands
+os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+os.environ["STRANDS_OTEL_ENABLE_CONSOLE_EXPORT"] = os.getenv("STRANDS_OTEL_ENABLE_CONSOLE_EXPORT", "true")
+
 import json
 import uuid
 import logging
@@ -15,29 +22,32 @@ from strands import Agent
 from strands.tools.mcp import MCPClient
 from mcp import ClientSession
 
+# Configure logging
+logging.basicConfig(
+    level=os.getenv('LOG_LEVEL', 'INFO'),  # Set default log level to INFO
+    format="%(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# Set log level for specific loggers
+logging.getLogger("tools.deck_recommender").setLevel(logging.INFO)  # Ensure deck_recommender logs are visible
+
+# Enable Strands debug logging if needed
+if os.getenv('STRANDS_DEBUG', 'false').lower() == 'true':
+    logging.getLogger("strands").setLevel(logging.DEBUG)
+
 # Langfuse imports with graceful fallback
 try:
     from langfuse import Langfuse
     from langfuse.decorators import observe, langfuse_context
     LANGFUSE_AVAILABLE = True
 except ImportError:
-    logger.warning("Langfuse not available - running without observability")
     LANGFUSE_AVAILABLE = False
     # Create no-op decorators for graceful fallback
     def observe(func):
         return func
     langfuse_context = None
-
-# Configure logging
-logging.basicConfig(
-    format="%(levelname)s | %(name)s | %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
-# Enable Strands debug logging if needed
-if os.getenv('STRANDS_DEBUG', 'false').lower() == 'true':
-    logging.getLogger("strands").setLevel(logging.DEBUG)
 
 # Global agent instance
 agent = None
@@ -50,11 +60,9 @@ def initialize_langfuse() -> Optional[Langfuse]:
     global langfuse_client
     
     if not LANGFUSE_AVAILABLE:
+        logger.info("Langfuse not available - running without observability")
         return None
         
-    if langfuse_client is not None:
-        return langfuse_client
-    
     try:
         public_key = os.getenv('LANGFUSE_PUBLIC_KEY')
         secret_key = os.getenv('LANGFUSE_SECRET_KEY')
@@ -112,11 +120,12 @@ class ShopifyStorefrontMCPManager:
         self.tools: List = []
         self.http_client: Optional[httpx.AsyncClient] = None
         
+    @observe(name="shopify_mcp.initialize_from_ssm")
     def initialize_from_ssm(self) -> bool:
         """Initialize Shopify Storefront MCP configuration from SSM parameters"""
         try:
             # Get shop domain from SSM
-            shop_url_param = os.environ.get('SHOPIFY_SHOP_URL_PARAM', '/tcg-agent/production/shopify/store-url')
+            shop_url_param = os.environ.get('SHOPIFY_STORE_URL_PARAM', '/tcg-agent/production/shopify/store-url')
             shop_url = get_ssm_parameter(shop_url_param)
             
             if not shop_url:
@@ -145,6 +154,7 @@ class ShopifyStorefrontMCPManager:
             logger.error(error_msg)
             raise RuntimeError(f"Shopify MCP initialization failed: {error_msg}")
     
+    @observe(name="shopify_mcp.discover_tools")
     async def discover_tools(self) -> bool:
         """Discover available tools from Shopify Storefront MCP server"""
         try:
@@ -180,6 +190,7 @@ class ShopifyStorefrontMCPManager:
         except Exception as e:
             raise RuntimeError(f"Failed to discover tools from Shopify Storefront MCP: {e}")
     
+    @observe(name="shopify_mcp.connect_and_discover_tools")
     def connect_and_discover_tools(self) -> bool:
         """Connect to Shopify Storefront MCP server and discover available tools"""
         try:
@@ -217,7 +228,7 @@ def get_ssm_parameter(parameter_name: str, decrypt: bool = False) -> Optional[st
     """Get parameter from AWS Systems Manager Parameter Store"""
     try:
         logger.info(f"Retrieving SSM parameter: {parameter_name}")
-        ssm = boto3.client('ssm')
+        ssm = boto3.client('ssm', region_name='us-east-1')  # Explicitly set region
         response = ssm.get_parameter(Name=parameter_name, WithDecryption=decrypt)
         value = response['Parameter']['Value']
         logger.info(f"Successfully retrieved SSM parameter: {parameter_name}")
@@ -232,15 +243,11 @@ def get_ssm_parameter(parameter_name: str, decrypt: bool = False) -> Optional[st
         logger.error(f"Failed to retrieve SSM parameter {parameter_name}: {e}")
         raise RuntimeError(f"Failed to retrieve SSM parameter {parameter_name}: {e}")
 
-@observe
 def initialize_environment():
     """Initialize environment variables from SSM parameters with comprehensive error handling"""
     missing_configs = []
     
     try:
-        # Initialize Langfuse client early
-        initialize_langfuse()
-        
         # Get API credentials from SSM if not already set
         if not os.getenv('COMPETITIVE_DECK_ENDPOINT'):
             endpoint_param = os.getenv('COMPETITIVE_DECK_ENDPOINT_PARAM', '/tcg-agent/production/deck-api/endpoint')
@@ -287,6 +294,9 @@ def initialize_environment():
             except Exception as e:
                 logger.warning(f"Langfuse secret key not configured - monitoring will be limited: {e}")
         
+        # Initialize Langfuse client after environment variables are set
+        initialize_langfuse()
+        
         # Initialize Shopify MCP configuration - FAIL if this fails
         try:
             shopify_initialized = shopify_mcp_manager.initialize_from_ssm()
@@ -307,7 +317,6 @@ def initialize_environment():
         logger.error(f"Environment initialization failed: {e}")
         raise RuntimeError(f"Agent configuration failed: {str(e)}")
 
-@observe
 def initialize_agent():
     """Initialize the Strands agent with full MCP integration following best practices"""
     global agent
@@ -340,11 +349,95 @@ def initialize_agent():
             logger.error(f"Shopify MCP integration failed: {e}")
             raise RuntimeError(f"Agent initialization failed due to Shopify MCP error: {e}")
         
+        # Define a Langfuse callback handler for Strands
+        def langfuse_callback_handler(**kwargs):
+            """Callback handler that sends Strands events to Langfuse"""
+            if not LANGFUSE_AVAILABLE or not langfuse_client:
+                return
+                
+            try:
+                # Handle text generation events
+                if "data" in kwargs:
+                    # Create or update generation in Langfuse
+                    if hasattr(langfuse_context, "current_trace"):
+                        langfuse_context.current_trace.generation(
+                            name="agent_response_chunk",
+                            input="",
+                            output=kwargs["data"],
+                            model="anthropic.claude-3-7-sonnet-20250219-v1:0",
+                            metadata={
+                                "gen_ai.event.type": "text_generation",
+                                "gen_ai.system": "strands-agents",
+                                "timestamp": str(uuid.uuid4())
+                            }
+                        )
+                
+                # Handle tool use events
+                elif "current_tool_use" in kwargs and kwargs["current_tool_use"].get("name"):
+                    tool = kwargs["current_tool_use"]
+                    tool_name = tool.get("name", "unknown_tool")
+                    tool_id = tool.get("toolUseId", str(uuid.uuid4()))
+                    
+                    # Create a span for the tool use
+                    if hasattr(langfuse_context, "current_trace"):
+                        langfuse_context.current_trace.span(
+                            name=f"tool_use_{tool_name}",
+                            input=json.dumps(tool.get("input", {})),
+                            output=json.dumps(tool.get("output", {})),
+                            metadata={
+                                "tool.name": tool_name,
+                                "tool.id": tool_id,
+                                "tool.status": tool.get("status", "unknown"),
+                                "gen_ai.event.type": "tool_use",
+                                "gen_ai.event.start_time": str(uuid.uuid4()),  # Ideally would be actual timestamp
+                                "gen_ai.event.end_time": str(uuid.uuid4()),    # Ideally would be actual timestamp
+                                "event_loop.cycle_id": kwargs.get("cycle_id", "unknown")
+                            }
+                        )
+                        
+                        # Flush to send data immediately
+                        langfuse_client.flush()
+                        
+                        logger.info(f"Langfuse trace updated with tool use: {tool_name}")
+                
+                # Handle cycle events if available
+                elif "cycle" in kwargs:
+                    cycle = kwargs.get("cycle", {})
+                    cycle_id = cycle.get("id", "unknown")
+                    
+                    if hasattr(langfuse_context, "current_trace"):
+                        langfuse_context.current_trace.span(
+                            name=f"cycle_{cycle_id}",
+                            input="",
+                            output="",
+                            metadata={
+                                "event_loop.cycle_id": cycle_id,
+                                "gen_ai.event.type": "agent_cycle",
+                                "gen_ai.event.start_time": str(uuid.uuid4()),  # Ideally would be actual timestamp
+                                "gen_ai.event.end_time": str(uuid.uuid4())     # Ideally would be actual timestamp
+                            }
+                        )
+                        
+                        langfuse_client.flush()
+            except Exception as e:
+                logger.error(f"Error in Langfuse callback handler: {e}")
+        
         # Create the agent following official Strands pattern
+        # Note: We rely on AWS_DEFAULT_REGION environment variable for region selection
+        # Use the inference profile ARN instead of direct model ID
         agent = Agent(
-            model="us.anthropic.claude-3-haiku-20240307-v1:0",
+            model="arn:aws:bedrock:us-east-1:438465137422:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
             tools=all_tools,
             system_prompt=TCG_SYSTEM_PROMPT,
+            callback_handler=langfuse_callback_handler,  # Add Langfuse callback handler
+            trace_attributes={
+                "service": "tcg-agent",
+                "version": "2.0",
+                "environment": os.getenv("ENVIRONMENT", "development"),
+                "model_provider": "anthropic",
+                "model_name": "claude-3-7-sonnet",
+                "region": os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+            }
         )
         
         logger.info(f"Strands agent initialized successfully with {len(all_tools)} total tools")
@@ -354,7 +447,6 @@ def initialize_agent():
         logger.error(f"Failed to initialize enhanced agent: {str(e)}")
         raise RuntimeError(f"Agent initialization failed: {str(e)}")
 
-@observe
 def parse_request_body(event: Dict[str, Any]) -> Dict[str, Any]:
     """Parse the request body from the Lambda event"""
     try:
@@ -374,7 +466,7 @@ def parse_request_body(event: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(body, dict):
             raise ValueError("Request body must be a JSON object")
         
-        input_text = body.get('input_text', body.get('message', ''))
+        input_text = body.get('input_text', body.get('inputText', body.get('message', '')))
         if not input_text or not isinstance(input_text, str):
             raise ValueError("Missing or invalid 'input_text' field - must be a non-empty string")
         
@@ -390,7 +482,49 @@ def parse_request_body(event: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(f"Failed to parse request body: {e}")
         raise ValueError(f"Invalid request format: {str(e)}")
 
-@observe
+def create_langfuse_trace(request_data: Dict[str, Any], context) -> Optional[Any]:
+    """Create Langfuse trace if available"""
+    if not LANGFUSE_AVAILABLE or not langfuse_client:
+        return None
+    
+    try:
+        trace = langfuse_client.trace(
+            name="tcg-agent-request",
+            input=request_data['input_text'],
+            session_id=request_data['session_id'],
+            metadata={
+                "cart_id": request_data.get('cart_id'),
+                "request_length": len(request_data['input_text']),
+                "lambda_request_id": context.aws_request_id if context else None
+            }
+        )
+        return trace
+    except Exception as e:
+        logger.error(f"Failed to create Langfuse trace: {e}")
+        return None
+
+def update_langfuse_trace(trace, response: str):
+    """Update Langfuse trace with response"""
+    if not trace:
+        return
+    
+    try:
+        trace.update(
+            output=str(response),
+            metadata={
+                "response_length": len(str(response)),
+                "shopify_integration_active": shopify_mcp_manager.is_connected(),
+                "tools_available": len(shopify_mcp_manager.get_tools()) if shopify_mcp_manager.is_connected() else 0
+            }
+        )
+        
+        # Flush to send data
+        if langfuse_client:
+            langfuse_client.flush()
+            
+    except Exception as e:
+        logger.error(f"Failed to update Langfuse trace: {e}")
+
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """Enhanced Lambda handler with comprehensive error handling and Shopify integration"""
     try:
@@ -402,17 +536,13 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         request_data = parse_request_body(event)
         logger.info(f"Processing request: {request_data['input_text'][:100]}...")
         
-        # Update Langfuse context with request metadata
-        if LANGFUSE_AVAILABLE and langfuse_context:
-            langfuse_context.update_current_observation(
-                input=request_data['input_text'],
-                session_id=request_data['session_id'],
-                metadata={
-                    "cart_id": request_data.get('cart_id'),
-                    "request_length": len(request_data['input_text']),
-                    "lambda_request_id": context.aws_request_id if context else None
-                }
-            )
+        # Create Langfuse trace
+        trace = create_langfuse_trace(request_data, context)
+        
+        # Set the trace as the current trace in langfuse_context if available
+        if LANGFUSE_AVAILABLE and trace and hasattr(langfuse_context, "set_current_trace"):
+            langfuse_context.set_current_trace(trace)
+            logger.info(f"Set current Langfuse trace: {trace.id}")
         
         # Initialize agent
         agent = initialize_agent()
@@ -426,16 +556,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         response = agent(input_text)
         logger.info("Agent response generated successfully")
         
-        # Update Langfuse context with response metadata
-        if LANGFUSE_AVAILABLE and langfuse_context:
-            langfuse_context.update_current_observation(
-                output=str(response),
-                metadata={
-                    "response_length": len(str(response)),
-                    "shopify_integration_active": shopify_mcp_manager.is_connected(),
-                    "tools_available": len(shopify_mcp_manager.get_tools()) if shopify_mcp_manager.is_connected() else 0
-                }
-            )
+        # Update Langfuse trace
+        update_langfuse_trace(trace, response)
         
         # Return enhanced response with capability information
         return {
@@ -452,7 +574,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 "capabilities": {
                     "deck_recommendations": True,
                     "shopify_integration": shopify_mcp_manager.is_connected(),
-                "available_tools": [tool.get("name", "unknown") for tool in shopify_mcp_manager.get_tools()] if shopify_mcp_manager.is_connected() else []
+                    "available_tools": [tool.get("name", "unknown") for tool in shopify_mcp_manager.get_tools()] if shopify_mcp_manager.is_connected() else []
                 },
                 "service_info": {
                     "name": "One Piece TCG Strands Agent",
@@ -599,7 +721,8 @@ def handle_enhanced_health_check(event: Dict[str, Any]) -> Dict[str, Any]:
             "environment": {
                 "strands_available": True,
                 "langfuse_configured": bool(os.getenv('LANGFUSE_PUBLIC_KEY')),
-                "deck_api_configured": bool(os.getenv('COMPETITIVE_DECK_ENDPOINT'))
+                "deck_api_configured": bool(os.getenv('COMPETITIVE_DECK_ENDPOINT')),
+                "aws_region": os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')  # Add region info to health check
             },
             "timestamp": str(uuid.uuid4())
         })

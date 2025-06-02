@@ -21,6 +21,10 @@ Globals:
         LANGFUSE_PUBLIC_KEY_PARAM: !Sub '/tcg-agent/${Environment}/langfuse/public-key'
         LANGFUSE_SECRET_KEY_PARAM: !Sub '/tcg-agent/${Environment}/langfuse/secret-key'
         LANGFUSE_HOST_PARAM: !Sub '/tcg-agent/${Environment}/langfuse/host'
+        # Langfuse Configuration - Set directly from SSM
+        LANGFUSE_PUBLIC_KEY: !Sub '{{resolve:ssm:/tcg-agent/${Environment}/langfuse/public-key}}'
+        # LANGFUSE_SECRET_KEY: Retrieved securely via SSM in code (not supported in Lambda env vars)
+        LANGFUSE_HOST: 'https://cloud.langfuse.com'
         # API Configuration
         COMPETITIVE_DECK_ENDPOINT_PARAM: !Sub '/tcg-agent/${Environment}/deck-api/endpoint'
         COMPETITIVE_DECK_SECRET_PARAM: !Sub '/tcg-agent/${Environment}/deck-api/secret'
@@ -90,6 +94,12 @@ Resources:
           title: !Sub '${AWS::StackName} API'
           version: '1.0'
         paths:
+          /:
+            post:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StrandsAgentFunction.Arn}/invocations'
           /{proxy+}:
             x-amazon-apigateway-any-method:
               x-amazon-apigateway-integration:
@@ -113,6 +123,15 @@ Resources:
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${StrandsApi}/*/*'
 
   # Health Check Permission
+  # Root Path Permission
+  StrandsAgentRootPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StrandsAgentFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${StrandsApi}/*/POST/'
+
   StrandsAgentHealthPermission:
     Type: AWS::Lambda::Permission
     Properties:

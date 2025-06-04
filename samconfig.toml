@@ -8,4 +8,4 @@ confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
 disable_rollback = true
 parameter_overrides = "Environment=\"production\""
-image_repositories = ["StrandsAgentFunction=438465137422.dkr.ecr.us-east-1.amazonaws.com/tcgagentprodaa41c671/strandsagentfunctionf3271a8brepo"]
+image_repositories = ["StrandsAgentFunction=438465137422.dkr.ecr.us-east-1.amazonaws.com/tcg-agent-prod-agent"]

@@ -1,11 +1,15 @@
 # Official Strands Agents SDK - Main package
 strands-agents>=0.1.0
 
-# AWS SDK for SSM parameter access
+# AWS SDK for SSM parameter access and WebSocket API
 boto3>=1.34.0
 
-# Requests for HTTP API calls
+# HTTP clients
 requests>=2.31.0
+httpx>=0.25.0  # For async HTTP requests
+
+# WebSocket support
+websockets>=12.0  # For WebSocket client/server
 
 # Langfuse for monitoring (optional but recommended)
 langfuse>=2.0.0

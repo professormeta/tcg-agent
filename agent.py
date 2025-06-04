@@ -317,11 +317,12 @@ def initialize_environment():
         logger.error(f"Environment initialization failed: {e}")
         raise RuntimeError(f"Agent configuration failed: {str(e)}")
 
-def initialize_agent():
+def initialize_agent(streaming=False):
     """Initialize the Strands agent with full MCP integration following best practices"""
     global agent
     
-    if agent is not None:
+    # Return existing agent if not streaming and agent exists
+    if agent is not None and not streaming:
         return agent
     
     try:
@@ -422,14 +423,60 @@ def initialize_agent():
             except Exception as e:
                 logger.error(f"Error in Langfuse callback handler: {e}")
         
+        # Define a streaming callback handler that captures reasoning and tool usage
+        def streaming_callback_handler(**kwargs):
+            """Callback handler that captures reasoning and tool usage for streaming"""
+            # First, call the Langfuse handler to maintain observability
+            langfuse_callback_handler(**kwargs)
+            
+            # Store the event in the request_state for streaming
+            # This will be used by the streaming endpoint to send events to the client
+            if hasattr(streaming_callback_handler, 'events_queue'):
+                event = {}
+                
+                # Handle text generation events
+                if "data" in kwargs:
+                    event = {
+                        "type": "text",
+                        "content": kwargs["data"],
+                        "complete": kwargs.get("complete", False)
+                    }
+                
+                # Handle tool use events
+                elif "current_tool_use" in kwargs and kwargs["current_tool_use"].get("name"):
+                    tool = kwargs["current_tool_use"]
+                    event = {
+                        "type": "tool",
+                        "name": tool.get("name", "unknown_tool"),
+                        "input": tool.get("input", {}),
+                        "status": tool.get("status", "unknown")
+                    }
+                
+                # Handle reasoning events
+                elif kwargs.get("reasoning", False) and "reasoningText" in kwargs:
+                    event = {
+                        "type": "reasoning",
+                        "content": kwargs.get("reasoningText", "")
+                    }
+                
+                # Add event to queue if not empty
+                if event:
+                    streaming_callback_handler.events_queue.append(event)
+        
+        # Initialize the events queue for streaming
+        streaming_callback_handler.events_queue = []
+        
+        # Choose the appropriate callback handler based on streaming flag
+        callback_handler = streaming_callback_handler if streaming else langfuse_callback_handler
+        
         # Create the agent following official Strands pattern
         # Note: We rely on AWS_DEFAULT_REGION environment variable for region selection
         # Use the inference profile ARN instead of direct model ID
-        agent = Agent(
+        new_agent = Agent(
             model="arn:aws:bedrock:us-east-1:438465137422:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
             tools=all_tools,
             system_prompt=TCG_SYSTEM_PROMPT,
-            callback_handler=langfuse_callback_handler,  # Add Langfuse callback handler
+            callback_handler=callback_handler,
             trace_attributes={
                 "service": "tcg-agent",
                 "version": "2.0",
@@ -440,8 +487,12 @@ def initialize_agent():
             }
         )
         
+        # Store the agent globally if not streaming
+        if not streaming:
+            agent = new_agent
+        
         logger.info(f"Strands agent initialized successfully with {len(all_tools)} total tools")
-        return agent
+        return new_agent
         
     except Exception as e:
         logger.error(f"Failed to initialize enhanced agent: {str(e)}")
@@ -524,6 +575,107 @@ def update_langfuse_trace(trace, response: str):
             
     except Exception as e:
         logger.error(f"Failed to update Langfuse trace: {e}")
+
+async def stream_agent_response(agent, input_text: str, session_id: str, cart_id: Optional[str] = None):
+    """Stream the agent response using async iterators"""
+    try:
+        # Prepare input text with cart ID if available
+        if cart_id:
+            input_text += f" (Cart ID: {cart_id})"
+        
+        # Get the async stream from the agent
+        agent_stream = agent.stream_async(input_text)
+        
+        # Process and yield events as they arrive
+        async for event in agent_stream:
+            # Format the event as a Server-Sent Event (SSE)
+            if "data" in event:
+                yield f"event: text\ndata: {json.dumps({'content': event['data']})}\n\n"
+            
+            elif "current_tool_use" in event and event["current_tool_use"].get("name"):
+                tool = event["current_tool_use"]
+                yield f"event: tool\ndata: {json.dumps({'name': tool.get('name'), 'input': tool.get('input')})}\n\n"
+            
+            elif event.get("reasoning", False) and "reasoningText" in event:
+                yield f"event: reasoning\ndata: {json.dumps({'content': event.get('reasoningText', '')})}\n\n"
+        
+        # Signal the end of the stream
+        yield "event: complete\ndata: {}\n\n"
+    except Exception as e:
+        logger.error(f"Error in streaming response: {e}")
+        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+async def lambda_handler_streaming(event: Dict[str, Any], context) -> Dict[str, Any]:
+    """Enhanced Lambda handler with streaming support"""
+    try:
+        # Handle health check
+        if event.get('httpMethod') == 'GET' or event.get('requestContext', {}).get('http', {}).get('method') == 'GET':
+            return handle_enhanced_health_check(event)
+        
+        # Parse request
+        request_data = parse_request_body(event)
+        logger.info(f"Processing streaming request: {request_data['input_text'][:100]}...")
+        
+        # Create Langfuse trace
+        trace = create_langfuse_trace(request_data, context)
+        
+        # Set the trace as the current trace in langfuse_context if available
+        if LANGFUSE_AVAILABLE and trace and hasattr(langfuse_context, "set_current_trace"):
+            langfuse_context.set_current_trace(trace)
+            logger.info(f"Set current Langfuse trace: {trace.id}")
+        
+        # Initialize agent with streaming enabled
+        streaming_agent = initialize_agent(streaming=True)
+        
+        # Create a streaming response
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type, x-session-id",
+                "Access-Control-Allow-Methods": "POST, GET, OPTIONS"
+            },
+            "body": stream_agent_response(
+                streaming_agent, 
+                request_data['input_text'],
+                request_data['session_id'],
+                request_data['cart_id']
+            ),
+            "isBase64Encoded": False
+        }
+    except ValueError as e:
+        # Request validation errors (400)
+        logger.error(f"Request validation error in streaming handler: {str(e)}")
+        return {
+            "statusCode": 400,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "error": "invalid_request",
+                "error_type": "request_validation_error",
+                "message": str(e)
+            })
+        }
+    except Exception as e:
+        # Unexpected errors (500)
+        logger.error(f"Unexpected error in streaming Lambda handler: {str(e)}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "error": "internal_server_error",
+                "error_type": "unexpected_error",
+                "message": f"An unexpected error occurred: {str(e)}"
+            })
+        }
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """Enhanced Lambda handler with comprehensive error handling and Shopify integration"""

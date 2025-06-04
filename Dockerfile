@@ -24,6 +24,7 @@ COPY --from=builder /app/dependencies ${LAMBDA_RUNTIME_DIR}
 # Copy application code
 COPY agent.py ${LAMBDA_RUNTIME_DIR}/lambda_function.py
 COPY aws_config.py ${LAMBDA_RUNTIME_DIR}/aws_config.py
+COPY websocket_handler.py ${LAMBDA_RUNTIME_DIR}/websocket_handler.py
 COPY tools/ ${LAMBDA_RUNTIME_DIR}/tools/
 
 # Set the CMD to your handler

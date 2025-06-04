@@ -128,6 +128,68 @@ def parse_websocket_message(body: str) -> Dict[str, Any]:
     except Exception as e:
         raise ValueError(f"Message parsing error: {e}")
 
+def process_streaming_message(endpoint_url: str, connection_id: str, input_text: str, session_id: str, cart_id: Optional[str] = None) -> bool:
+    """Process a message with streaming agent and send events to WebSocket client"""
+    try:
+        from agent import initialize_agent
+        
+        # Initialize streaming agent
+        streaming_agent = initialize_agent(streaming=True)
+        
+        # Prepare input text
+        if cart_id:
+            input_text += f" (Cart ID: {cart_id})"
+        
+        # Access the streaming callback handler's events queue
+        callback_handler = streaming_agent.callback_handler
+        if hasattr(callback_handler, 'events_queue'):
+            # Clear any existing events
+            callback_handler.events_queue.clear()
+        else:
+            logger.error("Streaming callback handler not properly configured")
+            return False
+        
+        # Process the message with the agent
+        logger.info(f"Processing streaming message: {input_text[:100]}...")
+        response = streaming_agent(input_text)
+        
+        # Send all captured events to the WebSocket client
+        events_sent = 0
+        if hasattr(callback_handler, 'events_queue'):
+            for event in callback_handler.events_queue:
+                success = send_message_to_connection(endpoint_url, connection_id, event)
+                if success:
+                    events_sent += 1
+                else:
+                    logger.warning(f"Failed to send event to {connection_id}: {event.get('type', 'unknown')}")
+        
+        # Send final response as text if no events were captured
+        if events_sent == 0:
+            final_message = {
+                'type': 'text',
+                'content': str(response),
+                'complete': True,
+                'timestamp': datetime.utcnow().isoformat()
+            }
+            send_message_to_connection(endpoint_url, connection_id, final_message)
+            events_sent = 1
+        
+        logger.info(f"Sent {events_sent} streaming events to {connection_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in process_streaming_message: {e}")
+        
+        # Send error message to client
+        error_message = {
+            'type': 'error',
+            'error': f"Streaming processing failed: {str(e)}",
+            'error_type': 'streaming_processing_error',
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        send_message_to_connection(endpoint_url, connection_id, error_message)
+        return False
+
 def message_handler(event, context):
     """Handle WebSocket messages with direct TCG Agent integration"""
     try:
@@ -188,39 +250,41 @@ def message_handler(event, context):
                 }
                 
         elif message_data['action'] == 'message':
-            # Handle message requests with TCG Agent directly
+            # Handle message requests with streaming TCG Agent
             try:
-                from agent import initialize_agent
-                
-                # Initialize the agent
-                agent = initialize_agent()
-                
-                # Prepare input text
-                input_text = message_data['message']
-                if message_data['cart_id']:
-                    input_text += f" (Cart ID: {message_data['cart_id']})"
-                
-                # Get response from the agent
-                agent_response = agent(input_text)
-                
-                # Send successful agent response
-                response_message = {
-                    'type': 'agent_response',
-                    'response': str(agent_response),
-                    'session_id': message_data['session_id'] or f"ws-{connection_id}",
-                    'capabilities': {
-                        'deck_recommendations': True,
-                        'shopify_integration': True,
-                        'available_tools': ['get_competitive_decks', 'search_shop_catalog']
-                    },
-                    'service_info': {
-                        'name': 'One Piece TCG Strands Agent',
-                        'version': '2.0',
-                        'interface': 'WebSocket'
-                    },
+                # Send processing status first
+                status_message = {
+                    'type': 'status',
+                    'status': 'processing',
                     'timestamp': datetime.utcnow().isoformat(),
                     'connectionId': connection_id
                 }
+                send_message_to_connection(endpoint_url, connection_id, status_message)
+                
+                # Process with streaming agent
+                success = process_streaming_message(
+                    endpoint_url, 
+                    connection_id, 
+                    message_data['message'],
+                    message_data['session_id'] or f"ws-{connection_id}",
+                    message_data['cart_id']
+                )
+                
+                if success:
+                    # Send completion message
+                    response_message = {
+                        'type': 'complete',
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'connectionId': connection_id
+                    }
+                else:
+                    response_message = {
+                        'type': 'error',
+                        'error': 'Failed to process streaming message',
+                        'error_type': 'streaming_error',
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'connectionId': connection_id
+                    }
                     
             except Exception as e:
                 logger.error(f"Agent processing error: {e}")

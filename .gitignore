@@ -109,14 +109,29 @@ packaging/_dependencies/
 
 # Local testing files
 test-*.json
+test_websocket_simple.js
 mock-*.json
 tests/*
 postman/*
 evals/*
 check_env.py
+response.json
+response-test.json
+websocket_client_example.html
+postman/*
 
-# Documentation - Only ignore personal notes
+# Documentation - Only ignore personal notes, not essential docs
 NOTES.md
 TODO.md
 SCRATCH.md
-# Keep README.md, API.md, DEPLOYMENT.md etc.
+UPDATED_ENDPOINTS.md
+STREAMING.md
+
+# Keep these important docs:
+# README.md
+# DEPLOYMENT_GUIDE.md
+# API.md
+
+# Development template files (superseded by template.yml)
+template-production.yml
+template-websocket-*.yml

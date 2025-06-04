@@ -49,7 +49,7 @@ Example: *Open the WebSocket client to see the agent's reasoning as it builds a 
 
 ### 🤖 Natural Conversation
 
-Powered by AWS Bedrock (Claude 3 Haiku):
+Powered by AWS Bedrock (Claude 3.5 Sonnet):
 
 - Understands complex TCG terminology and queries
 - Maintains context throughout conversations
